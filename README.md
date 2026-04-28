@@ -1,335 +1,495 @@
-# FIPE Crawler
+# FIPE Crawler API
 
-Script que realiza download dos dados da [Tabela FIPE Preço Médio de Veículos](http://veiculos.fipe.org.br/).
+API REST escrita em **Go** para extrair, persistir e consultar dados da [Tabela FIPE](https://veiculos.fipe.org.br/) (preços médios de veículos no Brasil).
 
-Licensa: [MIT](LICENSE.md)
+> Refatoração completa do projeto original em PHP (Symfony + AngularJS + MySQL) para uma arquitetura backend pura em Go com PostgreSQL.
 
-## Instalação
+---
 
-**Requisitos**
+## Sumário
 
-*   Versão linha de comando: PHP + PHP-CLI, MySQL, [Composer](getcomposer.org).
-*   Versão Web: PHP, Apache, MySQL, [Composer](getcomposer.org).
-*   Desenvolvimento versão Web: [NodeJS](https://nodejs.org) e [Bower](https://bower.io)
+- [Stack](#stack)
+- [Arquitetura](#arquitetura)
+- [Como rodar (Docker)](#como-rodar-docker)
+- [Como rodar (local)](#como-rodar-local)
+- [Variáveis de ambiente](#variáveis-de-ambiente)
+- [Schema do banco](#schema-do-banco)
+- [Endpoints](#endpoints)
+- [Fluxo recomendado](#fluxo-recomendado)
+- [Exemplos completos](#exemplos-completos)
+- [Tipos de veículo e combustível](#tipos-de-veículo-e-combustível)
+- [Testes](#testes)
+- [Estrutura de diretórios](#estrutura-de-diretórios)
+- [Solução de problemas](#solução-de-problemas)
+- [Licença](#licença)
 
-### Instalação versão linha de comando
+---
 
-```bash
-apt-get install php5 php5-cli php-mysql php5-curl php5-json mysql-server-5.5
-git clone https://github.com/rafaelgou/fipe-crawler.git
-curl -sS https://getcomposer.org/installer | php
-./composer.phar install
+## Stack
+
+| Camada | Tecnologia |
+|--------|-----------|
+| Linguagem | Go 1.26+ |
+| HTTP framework | [Gin](https://github.com/gin-gonic/gin) |
+| Banco de dados | PostgreSQL 16 |
+| Driver DB | [pgx/v5](https://github.com/jackc/pgx) (`pgxpool`) |
+| Configuração | [godotenv](https://github.com/joho/godotenv) |
+| Testes | `testing` + [testify](https://github.com/stretchr/testify) |
+| Containerização | Docker + Docker Compose |
+
+---
+
+## Arquitetura
+
+```
+┌──────────┐       ┌─────────────────────────┐       ┌──────────────┐
+│  Cliente │──────▶│  API (Gin) :8080        │──────▶│  PostgreSQL  │
+└──────────┘       │                         │       │   :5432      │
+                   │  ┌───────────────────┐  │       └──────────────┘
+                   │  │  handlers         │  │
+                   │  ├───────────────────┤  │       ┌──────────────┐
+                   │  │  crawler ─────────┼──┼──────▶│  FIPE API    │
+                   │  ├───────────────────┤  │       │  (HTTPS)     │
+                   │  │  repository       │  │       └──────────────┘
+                   │  └───────────────────┘  │
+                   └─────────────────────────┘
 ```
 
-### Instalação versão Web
+**Camadas:**
+
+- **`cmd/api`** — entrypoint: carrega configuração, conecta no Postgres (com retry), roda migrations, inicia o servidor HTTP com graceful shutdown.
+- **`internal/handlers`** — handlers HTTP (Gin). Recebem requisições, validam parâmetros e orquestram crawler + repository.
+- **`internal/crawler`** — cliente HTTP que consome a API pública da FIPE (`veiculos.fipe.org.br/api/veiculos/...`). Faz POST `application/x-www-form-urlencoded` com headers idênticos ao site oficial.
+- **`internal/repository`** — acesso ao banco via `pgxpool`. Faz batch insert com `ON CONFLICT (fipe_cod, anomod, comb_cod) DO NOTHING` para idempotência.
+- **`internal/models`** — structs (`Vehicle`, `Brand`, `Model`, `Table`, etc.).
+- **`internal/config`** — carrega env vars com fallback para defaults.
+- **`migrations/`** — SQL aplicado na inicialização (schema da tabela `veiculo`).
+
+---
+
+## Como rodar (Docker)
+
+**Requisito:** Docker + Docker Compose v2.
 
 ```bash
-apt-get install php5 php5-cli php-mysql php5-curl php5-json mysql-server-5.5 apache2 libapache2-mod-php5
-git clone https://github.com/rafaelgou/fipe-crawler.git
-curl -sS https://getcomposer.org/installer | php
-./composer.phar install
+# Build e sobe API + PostgreSQL
+sudo docker compose up --build -d
+
+# Verifica que está rodando
+curl http://localhost:8080/
+
+# Acompanhar logs
+sudo docker compose logs -f app
+
+# Parar
+sudo docker compose down
+
+# Parar e apagar dados do banco
+sudo docker compose down -v
 ```
-Para desenvolvimento utilize também `bower install` (exige [NodeJS](https://nodejs.org) ).
 
-A versão Web foi construída [AngularJS](http://angularjs.org) v1.3.20, ou seja,
-está bastante desatualizada. Utilize preferencialmente a versão de linha de
-comando.
+| Serviço | Porta host | Descrição |
+|---------|-----------|-----------|
+| `app` | `8080` | API Go |
+| `db` | `5432` | PostgreSQL (user: `fipe`, pass: `fipe`, db: `fipe`) |
 
-### Configuração
+A API espera o banco ficar pronto e tenta reconectar até 10× com 2s de intervalo.
+
+---
+
+## Como rodar (local)
+
+**Requisitos:** Go 1.26+, PostgreSQL rodando.
 
 ```bash
-cd fipecrawler/config
-cp config.dist.php config.php
+# 1. Crie o banco
+createdb -U postgres fipe
+
+# 2. Configure variáveis
+cp .env.example .env
+# edite DATABASE_URL conforme seu setup
+
+# 3. Baixe dependências e rode
+go mod download
+go run ./cmd/api
 ```
 
-Editar informações de acesso ao banco e URL para versão Web:
+A migration roda automaticamente no start.
 
-```php
-<?php
-$db = array(
-    'host'   => 'localhost',
-    'dbname' => 'fipe',
-    'user'   => 'root',
-    'pass'   => 'senha',
+---
+
+## Variáveis de ambiente
+
+| Var | Default | Descrição |
+|-----|---------|-----------|
+| `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/fipe?sslmode=disable` | Connection string PostgreSQL |
+| `PORT` | `8080` | Porta HTTP |
+
+Arquivo `.env` é carregado automaticamente se existir (via `godotenv`).
+
+---
+
+## Schema do banco
+
+```sql
+CREATE TABLE veiculo (
+    id          SERIAL PRIMARY KEY,
+    fipe_cod    VARCHAR(10),
+    tabela_id   INTEGER NOT NULL,
+    anoref      SMALLINT NOT NULL,    -- ano de referência
+    mesref      SMALLINT NOT NULL,    -- mês de referência (1-12)
+    tipo        SMALLINT NOT NULL,    -- 1=carro, 2=moto, 3=caminhão
+    marca_id    INTEGER NOT NULL,
+    marca       VARCHAR(50),
+    modelo_id   INTEGER NOT NULL,
+    modelo      VARCHAR(255) NOT NULL,
+    anomod      SMALLINT NOT NULL,    -- ano do modelo (32000 = 0km)
+    comb_cod    SMALLINT NOT NULL,    -- código do combustível
+    comb_sigla  CHAR(1) NOT NULL,     -- G, A, D, F
+    comb        VARCHAR(10) NOT NULL,
+    valor       INTEGER NOT NULL      -- preço em reais (sem casas decimais)
 );
+
+CREATE UNIQUE INDEX veiculo_fipe_cod_anomod_comb_cod
+    ON veiculo (fipe_cod, anomod, comb_cod);
 ```
 
-Crie a tabela `veiculo` no banco de dados com o seguinte comando:
+---
+
+## Endpoints
+
+### Health
+
+#### `GET /`
+Health check.
+```json
+{ "msg": "FIPE Crawler API" }
+```
+
+---
+
+### Consultas live na FIPE (não persiste)
+
+#### `GET /tabelas`
+Lista todas as tabelas de referência disponíveis na FIPE (uma por mês).
+
+**Resposta:**
+```json
+[
+  { "id": 332, "lbl": "abril/2026 ", "ano": "2026", "mes": "04" },
+  { "id": 331, "lbl": "março/2026 ", "ano": "2026", "mes": "03" }
+]
+```
+
+#### `GET /marcas?tabela_id={id}&tipo={1|2|3}`
+Lista marcas para uma tabela e tipo de veículo.
+
+**Resposta:**
+```json
+[
+  { "id": 1, "label": "Acura", "tipo": 1 },
+  { "id": 2, "label": "Agrale", "tipo": 1 }
+]
+```
+
+#### `GET /modelos?tabela_id={id}&tipo={tipo}&marca_id={id}`
+Lista modelos de uma marca.
+
+**Resposta:**
+```json
+[
+  { "id": 1, "label": "Integra GS 1.8", "tipo": 1 },
+  { "id": 2, "label": "Legend 3.2/3.5", "tipo": 1 }
+]
+```
+
+---
+
+### Extração e persistência
+
+#### `POST /extrair/marcas`
+Retorna marcas (atalho para o GET equivalente, mas via POST).
+
+**Body:**
+```json
+{ "tabela_id": 332, "tipo": 1 }
+```
+
+#### `POST /extrair/modelos`
+**Body:**
+```json
+{ "tabela_id": 332, "tipo": 1, "marca_id": 1 }
+```
+
+#### `POST /extrair/veiculos`
+Extrai **todos os veículos de uma marca específica** (todos os modelos × todos os anos × todos os combustíveis) e salva no banco.
+
+**Body:**
+```json
+{ "tabela_id": 332, "tipo": 1, "marca_id": 1 }
+```
+
+**Resposta:**
+```json
+{ "saved": 432 }
+```
+
+⚠️ **Demorado** — pode levar minutos por marca, dependendo da quantidade de modelos.
+
+#### `POST /extrair/tudo`
+Extrai **todos os veículos** de uma tabela inteira para um tipo (todas as marcas).
+
+**Body:**
+```json
+{ "ano": "2026", "mes": "4", "tipo": 1 }
+```
+
+**Resposta:**
+```json
+{
+  "tabela_id": 332,
+  "periodo": "04/2026",
+  "tipo": 1,
+  "total": 27251
+}
+```
+
+⚠️ **Muito demorado** — pode levar **horas** (a FIPE limita requests). Para `tipo=1` (carros) é comum levar 1h+.
+
+A inserção usa `ON CONFLICT DO NOTHING` na chave `(fipe_cod, anomod, comb_cod)`, então rodar duas vezes não duplica registros.
+
+---
+
+### Consultas no banco
+
+#### `GET /tabelas/salvas`
+Tabelas (período + tipo) já extraídas e salvas no banco.
+
+**Resposta:**
+```json
+{
+  "results": [
+    { "id": "332-1", "lbl": "abril/2026 - carro" }
+  ]
+}
+```
+
+#### `GET /veiculos?tabela_id={id}&tipo={tipo}`
+Lista veículos salvos de uma tabela e tipo.
+
+**Resposta:**
+```json
+[
+  {
+    "id": 1,
+    "fipe_cod": "038003-2",
+    "tabela_id": 332,
+    "anoref": 2026,
+    "mesref": 4,
+    "tipo": 1,
+    "marca_id": 1,
+    "marca": "Acura",
+    "modelo_id": 1,
+    "modelo": "Integra GS 1.8",
+    "anomod": 1992,
+    "comb_cod": 1,
+    "comb_sigla": "G",
+    "comb": "Gasolina",
+    "valor": 14852
+  }
+]
+```
+
+#### `GET /veiculos/csv?tabela_id={id}&tipo={tipo}`
+Faz download do CSV com todos os veículos da tabela/tipo.
 
 ```bash
-mysql fipe -u root -p < sql/veiculo.sql
+curl "http://localhost:8080/veiculos/csv?tabela_id=332&tipo=1" -o fipe.csv
 ```
 
-## Execução via linha de comando
-
-Na raiz do sistema, execute:
+#### `GET /veiculos/search?q={termo}`
+Busca veículos no banco por marca, modelo ou código FIPE (`ILIKE`).
 
 ```bash
-./fipecrawler
+curl "http://localhost:8080/veiculos/search?q=civic"
 ```
 
-que exibe ajuda padrão e lista de comandos do sistema:
+---
+
+## Fluxo recomendado
+
+1. **Liste as tabelas disponíveis** na FIPE:
+   ```bash
+   curl http://localhost:8080/tabelas
+   ```
+
+2. **Extraia tudo** para o período/tipo desejado (demorado):
+   ```bash
+   curl -X POST http://localhost:8080/extrair/tudo \
+     -H "Content-Type: application/json" \
+     -d '{"ano":"2026","mes":"4","tipo":1}'
+   ```
+
+3. **Consulte ou exporte** os dados salvos:
+   ```bash
+   curl "http://localhost:8080/veiculos/csv?tabela_id=332&tipo=1" -o fipe_abril_2026_carros.csv
+   ```
+
+---
+
+## Exemplos completos
+
+### Listar tabelas, escolher uma e extrair só uma marca
 
 ```bash
-veiculo
- veiculo:csv       Exporta arquivo CSV por ano, mês e tipo
- veiculo:extrair   Extrai tabela por ano, mês e tipo
+# Tabela mais recente
+TABELA=$(curl -s http://localhost:8080/tabelas | jq '.[0].id')
+
+# Marcas de carro
+curl -s "http://localhost:8080/marcas?tabela_id=$TABELA&tipo=1" | jq
+
+# Extrai todos os Honda da tabela mais recente (marca_id=25 — verificar)
+curl -X POST http://localhost:8080/extrair/veiculos \
+  -H "Content-Type: application/json" \
+  -d "{\"tabela_id\":$TABELA,\"tipo\":1,\"marca_id\":25}"
 ```
 
-Possível então:
+### Buscar todos os Civic salvos
 
 ```bash
-./fipecrawler veiculo:extrair
-./fipecrawler veiculo:csv
+curl "http://localhost:8080/veiculos/search?q=civic" | jq
 ```
 
-### Extraindo tabelas
+---
+
+## Tipos de veículo e combustível
+
+### Tipos
+| Código | Tipo |
+|-------|------|
+| 1 | Carro |
+| 2 | Moto |
+| 3 | Caminhão |
+
+### Combustíveis
+| Código | Sigla | Nome |
+|--------|-------|------|
+| 1 | G | Gasolina |
+| 2 | A | Álcool |
+| 3 | D | Diesel |
+| 4 | F | Flex |
+
+### Ano modelo especial
+- `32000` = veículo **0 km** (zero quilômetros / ano corrente).
+
+---
+
+## Script interativo
+
+`fipe.sh` é um menu em bash que cobre **todas** as operações da API:
 
 ```bash
-./fipecrawler veiculo:extrair 2015 3 Caminhão
+./fipe.sh
 ```
 
-ou
+Requisitos: `curl` e `jq`.
+
+**Menu:**
+
+```
+Consultas live (FIPE):
+  1) Health check
+  2) Listar tabelas FIPE
+  3) Listar marcas
+  4) Listar modelos
+
+Extração / persistência:
+  5) Extrair veículos de uma marca
+  6) Extrair tudo de um período (ano/mês/tipo)
+  7) Baixar TUDO (histórico completo)
+
+Banco de dados:
+  8) Tabelas salvas
+  9) Listar veículos salvos
+ 10) Buscar veículos
+ 11) Exportar CSV
+
+Utilitários:
+ 12) Smoke test
+ 13) Status containers
+ 14) Logs Docker
+```
+
+A opção **7** (baixar tudo) permite limitar últimos N meses e escolher tipos. Gera log com timestamp em `fipe_download_YYYYMMDD_HHMMSS.log` e é idempotente (pode interromper e rodar de novo).
+
+## Testes unitários
 
 ```bash
-./fipecrawler veiculo:extrair
+go test ./...
 ```
 
-o que pergunta:
+---
 
-```bash
---------------------------------------------------------------------------------
-
-  FIPE Crawler
-  veiculo:extrair
-  Extrai tabela por ano, mês e tipo
-
---------------------------------------------------------------------------------
-Informe ano (ENTER para 2015)
-  [2015] 2015
-  [2014] 2014
-  [2013] 2013
-  [2012] 2012
-  [2011] 2011
-  [2010] 2010
-  [2009] 2009
-  [2008] 2008
-  [2007] 2007
-  [2006] 2006
-  [2005] 2005
-  [2004] 2004
-  [2003] 2003
-  [2002] 2002
-  [2001] 2001
- >
-Informe mês (1 a 12) (ENTER para 03)
-  [1 ] 1
-  [2 ] 2
-  [3 ] 3
-  [4 ] 4
-  [5 ] 5
-  [6 ] 6
-  [7 ] 7
-  [8 ] 8
-  [9 ] 9
-  [10] 10
-  [11] 11
-  [12] 12
- >
-Informe tipo (1 = carro, 2 = moto, 3 = caminhão) (ENTER para Carro)
-  [1] Carro
-  [2] Moto
-  [3] Caminhão
- >
-```
-
-após, realiza a extração e salva em banco. Este procedimento é demorado,
-e depende da velocidade de sua conexão e disponibilidade do site da FIPE.
-
-Você pode acompanhar o progresso nesta tela:
-
-```bash
-Recuperando tabelas para 03/2015...
-Encontrada tabela 03/2015 !
-
-Recuperando marcas para tabela id=[176] 03/2015, tipo=[1] Carro...
-Encontradas 87 marcas para tabela id=[176] 03/2015, tipo=[1] Carro !
-
-Recuperando modelos para 87 marcas -- tabela id=[176] 03/2015, tipo=[1] Carro...
-
- 87/87 [============================] 4562 modelos extraídos
-Encontrados 4562 modelos para 87 marcas -- tabela id=[176] 03/2015, tipo=[1] Carro !
-
-Recuperando veiculos para para 4562 -- tabela id=[176] 03/2015, tipo=[1] Carro...
-    6/4562 [>---------------------------] 36 veículos extraídos
-```
-
-Neste ponto os dados já podem ser vistos no banco de dados. Como a tabela
-possui chave única para `fipe_cod + anomod`, não há duplicação, mesmo se rodar
-mais de uma vez para o mesmo período.
-
-### Exportando CSV tabelas
-
-Executado da mesma forma que o `veiculo:extrair`, mas solicita o
-nome do arquivo de exportação.
-
-```bash
-./fipecrawler veiculo:csv 2015 3 Caminhão
-```
-
-ou
-
-```bash
-./fipecrawler veiculo:csv
-```
-
-Exemplo:
-
-```bash
-./fipecrawler veiculo:csv 2015 3 Caminhão
---------------------------------------------------------------------------------
-
-  FIPE Crawler
-  veiculo:csv
-  Exporta arquivo CSV por ano, mês e tipo
-
---------------------------------------------------------------------------------
-Informe nome do arquivo (padrao 'fipe_201503_Caminhão.csv'):
---------------------------------------------------------------------------------
-
-  FIPE Crawler
-  veiculo:csv
-  Exporta arquivo CSV por ano, mês e tipo
-
---------------------------------------------------------------------------------
-
-Recuperando veículos para tabela 03/2015, tipo=[3] Caminhão...
-Encontrados 78 veículos para tabela 03/2015, tipo=[3] Caminhão
- 78/78 [============================] veículos exportados
-Exportados 78 veículos para tabela 03/2015, tipo=[3] Caminhão !
-Tentando salvar arquivo /var/www/Clientes/DiegoVeiga/Fipe/fipecrawler/fipe_201503_Caminhão.csv...
-Criado arquivo /var/www/Clientes/DiegoVeiga/Fipe/fipecrawler/fipe_201503_Caminhão.csv !
+## Estrutura de diretórios
 
 ```
-
-Arquivo exemplo:
-
-```bash
-fipe_cod,tabela_id,anoref,mesref,tipo,marca_id,marca,modelo_id,modelo,anomod,comb_cod,comb_sigla,comb,valor
-501034-9,176,2015,3,3,102,Agrale,5986,10000 2P (Diesel) (E5),32000,3,D,Diesel,134625
-501034-9,176,2015,3,3,102,Agrale,5986,10000 2P (Diesel) (E5),2015,3,D,Diesel,119985
-501034-9,176,2015,3,3,102,Agrale,5986,10000 2P (Diesel) (E5),2014,3,D,Diesel,115125
-501034-9,176,2015,3,3,102,Agrale,5986,10000 2P (Diesel) (E5),2013,3,D,Diesel,109087
-501034-9,176,2015,3,3,102,Agrale,5986,10000 2P (Diesel) (E5),2012,3,D,Diesel,102992
-501027-6,176,2015,3,3,102,Agrale,4448,13000 Turbo 2P (Diesel),2012,3,D,Diesel,104763
-501027-6,176,2015,3,3,102,Agrale,4448,13000 Turbo 2P (Diesel),2011,3,D,Diesel,97221
-501027-6,176,2015,3,3,102,Agrale,4448,13000 Turbo 2P (Diesel),2010,3,D,Diesel,88952
-501027-6,176,2015,3,3,102,Agrale,4448,13000 Turbo 2P (Diesel),2009,3,D,Diesel,82993
-501027-6,176,2015,3,3,102,Agrale,4448,13000 Turbo 2P (Diesel),2008,3,D,Diesel,79413
-501027-6,176,2015,3,3,102,Agrale,4448,13000 Turbo 2P (Diesel),2007,3,D,Diesel,72479
+fipe-crawler/
+├── cmd/
+│   └── api/
+│       └── main.go              # entrypoint do servidor
+├── internal/
+│   ├── config/
+│   │   └── config.go            # carga de env vars
+│   ├── crawler/
+│   │   ├── crawler.go           # cliente HTTP da FIPE
+│   │   └── crawler_test.go
+│   ├── handlers/
+│   │   ├── handlers.go          # rotas Gin
+│   │   └── handlers_test.go
+│   ├── models/
+│   │   └── models.go            # structs do domínio
+│   └── repository/
+│       └── repository.go        # acesso ao Postgres
+├── migrations/
+│   └── 001_initial_schema.sql   # schema aplicado no boot
+├── .env.example
+├── docker-compose.yml
+├── Dockerfile                   # multi-stage (builder + alpine)
+├── go.mod / go.sum
+├── fipe.sh                      # menu interativo (CLI)
+└── README.md
 ```
 
-## Versão WEB
+---
 
-Descompacte/clone o conteúdo na raiz de sua árvore web. Opcionalmente você pode criar um VirtualHost,
-link simbólico ou alias para o diretório `web/`.
+## Solução de problemas
 
-Considerando que você utiliza o Apache2, necessita:
+### `failed to ping database: hostname resolving error: lookup db on 127.0.0.11:53`
+O DNS interno do Docker ainda não está pronto quando o app sobe. **Já é tratado** com retry de 10× (2s de intervalo) no `cmd/api/main.go`. Se persistir, aumente o número de tentativas.
 
-```bash
-composer install
+### `Bind for 0.0.0.0:5432 failed: port is already allocated`
+Você tem um PostgreSQL rodando localmente ocupando a porta 5432. Soluções:
+- Pare o serviço local: `sudo systemctl stop postgresql`
+- Ou mude a porta no `docker-compose.yml`:
+  ```yaml
+  ports:
+    - "5433:5432"
+  ```
+
+### `go: go.mod requires go >= 1.26.2 (running go 1.23.x)`
+Atualize a imagem base no `Dockerfile`:
+```dockerfile
+FROM golang:1.26-alpine AS builder
 ```
 
-```bash
-cd fipecrawler/config
-cp config.dist.php config.php
-```
+### Extração lenta / timeout na FIPE
+A FIPE limita requisições por IP. O cliente HTTP usa timeout de 30s por request. Se a FIPE retornar 5xx, simplesmente repita — `ON CONFLICT DO NOTHING` impede duplicatas.
 
-Editar informações de acesso ao banco:
+### `502 Bad Gateway` ao chamar `/marcas` ou `/modelos`
+A FIPE pode retornar erro temporariamente. Tente de novo. Se persistir, verifique se os parâmetros (`tabela_id`, `tipo`) são válidos.
 
-```php
-<?php
-$db = array(
-    'host'   => 'localhost',
-    'dbname' => 'fipe',
-    'user'   => 'root',
-    'pass'   => 'senha',
-);
-```
+---
 
-Considerando que foi descompatado na raiz, você terá a interface web navegando em
-[http://localhost/fipecrawler/web](http://localhost/fipecrawler/web).
+## Licença
 
-Se quiser navegar na versão de desenvolvimento, utilize
-[http://localhost/fipecrawler/web/index_dev.php](http://localhost/fipecrawler/web/index_dev.php).
-
-## Consultas
-
-Verifique a tabela [veiculo](sql/veiculo.sql) para a estrutura de dados.
-
-Informações úteis podem ser conseguidas com as seguintes consultas:
-
-*   Lista de marcas
-
-```sql
-SELECT DISTINCT marca_id, marca FROM veiculo ORDER BY marca;
-```
-
-*   Lista de marcas e modelos
-
-```sql
-SELECT DISTINCT marca_id, marca, modelo_id, modelo FROM veiculo ORDER BY marca, modelo;
-```
-
-*   Filtrar por tipo (1 = carro, 2 = moto, 3 = caminhão)
-
-```sql
--- Selecionando carros
-SELECT * FROM veiculo WHERE tipo = 1;
-```
-
-*   Lista de combustíveis
-
-```sql
-SELECT DISTINCT comb_sigla, comb FROM veiculo ORDER BY comb_sigla, comb;
-```
-
-
-```bash
-$ time ./fipecrawler veiculo:extrair 2023 1 Carro
---------------------------------------------------------------------------------
-                                                                                
-  FIPE Crawler                                                                  
-  veiculo:extrair                                                               
-  Extrai tabela por ano, mês e tipo                                            
-                                                                                
---------------------------------------------------------------------------------
-
-Recuperando tabelas para 01/2023...
-Encontrada tabela 01/2023 !
-
-Recuperando marcas para tabela id=[293] 01/2023, tipo=[1] Carro...
-Encontradas 92 marcas para tabela id=[293] 01/2023, tipo=[1] Carro !
-
-Recuperando modelos para 92 marcas -- tabela id=[293] 01/2023, tipo=[1] Carro...
-
- 92/92 [============================] 6533 modelos extraídos
-Encontrados 6533 modelos para 92 marcas -- tabela id=[293] 01/2023, tipo=[1] Carro !
-
-Recuperando veiculos para para 6533 -- tabela id=[293] 01/2023, tipo=[1] Carro...
- 6533/6533 [============================] 27251 veículos extraídos
-Extraídos 27251 veículos -- tabela id=[293] 01/2023, tipo=[1] Carro !
-
---------------------------------------------------------------------------------
-                                                                                
-FIPE Crawler executado com sucesso em 14h2m9s, memória 8 megabytes             
-                                                                                
---------------------------------------------------------------------------------
-FIPE Crawler executado com sucesso!
-
-
-real	69m57.767s
-user	4m42.890s
-sys	0m18.617s
-
-```
+[MIT](LICENSE.md)
