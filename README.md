@@ -20,7 +20,6 @@ API REST escrita em **Go** para extrair, persistir e consultar dados da [Tabela 
 - [Tipos de veículo e combustível](#tipos-de-veículo-e-combustível)
 - [Testes](#testes)
 - [Estrutura de diretórios](#estrutura-de-diretórios)
-- [Solução de problemas](#solução-de-problemas)
 - [Licença](#licença)
 
 ---
@@ -459,34 +458,6 @@ fipe-crawler/
 ├── fipe.sh                      # menu interativo (CLI)
 └── README.md
 ```
-
----
-
-## Solução de problemas
-
-### `failed to ping database: hostname resolving error: lookup db on 127.0.0.11:53`
-O DNS interno do Docker ainda não está pronto quando o app sobe. **Já é tratado** com retry de 10× (2s de intervalo) no `cmd/api/main.go`. Se persistir, aumente o número de tentativas.
-
-### `Bind for 0.0.0.0:5432 failed: port is already allocated`
-Você tem um PostgreSQL rodando localmente ocupando a porta 5432. Soluções:
-- Pare o serviço local: `sudo systemctl stop postgresql`
-- Ou mude a porta no `docker-compose.yml`:
-  ```yaml
-  ports:
-    - "5433:5432"
-  ```
-
-### `go: go.mod requires go >= 1.26.2 (running go 1.23.x)`
-Atualize a imagem base no `Dockerfile`:
-```dockerfile
-FROM golang:1.26-alpine AS builder
-```
-
-### Extração lenta / timeout na FIPE
-A FIPE limita requisições por IP. O cliente HTTP usa timeout de 30s por request. Se a FIPE retornar 5xx, simplesmente repita — `ON CONFLICT DO NOTHING` impede duplicatas.
-
-### `502 Bad Gateway` ao chamar `/marcas` ou `/modelos`
-A FIPE pode retornar erro temporariamente. Tente de novo. Se persistir, verifique se os parâmetros (`tabela_id`, `tipo`) são válidos.
 
 ---
 
